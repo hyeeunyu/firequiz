@@ -87,7 +87,12 @@ async function boot() {
 
   // 앱이 AI 채점 도중 닫혔던 경우 정리
   for (const a of state.attempts.values()) {
-    if (a.ai_status === 'pending') { a.ai_status = 'error'; a.ai_error = '앱이 닫혀 채점이 중단되었습니다. 다시 시도하세요.'; await db.put('attempts', a); }
+    if (a.ai_status === 'pending') {
+      const batch = a.ai_pending_mode === 'batch';
+      a.ai_status = batch ? 'waiting' : 'error'; delete a.ai_pending_mode;
+      a.ai_error = batch ? '앱이 닫혀 채점이 중단되었습니다. ‘전체 채점’을 다시 누르면 서술형만 다시 요청합니다.' : '앱이 닫혀 채점이 중단되었습니다. 다시 시도하세요.';
+      await db.put('attempts', a);
+    }
   }
 
   window.addEventListener('online', () => { state.online = true; renderStatus(); syncNow('online'); });
@@ -194,7 +199,9 @@ async function saveAttempt(a, { bump = true } = {}) {
 
 export function finalResult(a) {
   if (!a || !a.answered_at) return 'pending';
+  if (a.override === 'correct') return 'correct';          // 기기 판정 오답을 사용자가 '정답으로 수정'
   if (a.auto_check === 'alias_match') return 'correct';
+  if (a.auto_check === 'local_wrong') return 'wrong';      // 전체 채점: 허용 답안 불일치 → 기기에서 오답 확정
   const s = a.self_assessment, v = a.ai_verdict;
   if (s === 'incorrect' || s === 'needs_review' || v === 'incorrect' || v === 'partial') return 'wrong';
   if (s === 'correct' || v === 'correct') return 'correct';
@@ -487,6 +494,12 @@ function mergeConflict(L, S) {
     Object.assign(m, { ai_status: 'done', ai_verdict: S.ai_verdict, ai_score: S.ai_score, ai_feedback: S.ai_feedback,
       ai_detail: S.ai_detail || null, ai_graded_at: S.ai_graded_at, ai_mode: S.ai_mode || '', ai_error: '' });
   }
+  // 기기 판정(전체 채점)과 '정답으로 수정': 판정이 없는 쪽은 있는 쪽을 따르고, 수정은 더 늦은 쪽
+  if (L.auto_check !== 'alias_match' && L.auto_check !== 'local_wrong' && S.local_graded_at && ['alias_match', 'local_wrong'].includes(S.auto_check)) {
+    m.auto_check = S.auto_check; m.local_graded_at = S.local_graded_at;
+  }
+  if ((S.override_at || '') > (L.override_at || '')) { m.override = S.override || ''; m.override_at = S.override_at; }
+  if (L.ai_status === 'waiting' && S.ai_status === 'done') { /* 위 AI 규칙에서 이미 반영 */ }
   m.rev = Math.max(L.rev || 0, Rs) + 1;
   m.synced_rev = Rs;
   m.updated_at = nowIso();
@@ -501,7 +514,8 @@ function toServerRecord(a) {
     origin: a.origin, unit: a.unit, topic: a.topic, review_status: a.review_status,
     question_text: a.question_text, model_answer: a.model_answer, submitted_answer: a.submitted_answer,
     auto_check: a.auto_check, self_assessment: a.self_assessment, self_assessed_at: a.self_assessed_at || null,
-    ai_status: a.ai_status === 'pending' ? 'none' : a.ai_status,
+    ai_status: a.ai_status === 'pending' ? (a.ai_pending_mode === 'batch' ? 'waiting' : 'none') : a.ai_status,
+    override: a.override || '', override_at: a.override_at || null, local_graded_at: a.local_graded_at || null,
     ai_verdict: a.ai_verdict, ai_score: a.ai_score, ai_feedback: a.ai_feedback, ai_detail: a.ai_detail || null, ai_mode: a.ai_mode || '',
     source_pages: a.source_pages, answered_at: a.answered_at, model_viewed_at: a.model_viewed_at,
     ai_graded_at: a.ai_graded_at, created_at: a.created_at, updated_at: a.updated_at, device_id: a.device_id,
@@ -581,7 +595,12 @@ async function aiGrade(a) {
   render();
 }
 
-/* ---------- 세트 일괄 처리: 전체 답안 제출·AI 일괄 채점 / 전체 모범답안 보기 ---------- */
+/* ---------- 세트 전체 채점 / 전체 모범답안 보기 ----------
+ * 단답형: Gemini에 보내지 않는다. 모범답안 + accepted_answers와 기기에서 비교해 정답·오답을 확정한다.
+ *         (normalize: NFKC·소문자·공백 제거만, 숫자 부호·소수점·기호는 그대로)
+ *         판정 뒤 모범답안을 보여 주고, 동의하지 않으면 '정답으로 수정'(override)할 수 있다.
+ * 서술형: AI 일괄 채점(요청 1회). 오프라인·실패 시 단답형 결과는 그대로 두고 서술형만 'waiting'(채점 대기).
+ */
 function sessionEntries() {
   const s = state.session;
   if (!s) return [];
@@ -589,44 +608,85 @@ function sessionEntries() {
 }
 const isEmptyDraft = (a) => !a.answered_at && !(a.submitted_answer || '').trim();
 const aliasMatch = (q, ans) => { const n = normalize(ans); return !!n && [q.model_answer, ...(q.accepted_answers || [])].map(normalize).includes(n); };
-const needsAi = (a) => a.answered_at && a.auto_check !== 'alias_match' && (a.submitted_answer || '').trim() && a.ai_status !== 'done' && a.ai_status !== 'pending';
+const isShortQ = (q) => q.type === 'short_answer';
+// 개별 제출 뒤 아직 아무 판단도 없는 단답형(허용 답안 불일치·자기평가 없음·AI 없음) → 전체 채점에서 기기 판정 대상
+const shortNeedsLocal = (a) => a.answered_at && a.type === 'short_answer' && a.auto_check === 'no_match'
+  && (!a.self_assessment || a.self_assessment === 'not_assessed') && a.ai_status !== 'done' && a.ai_status !== 'pending';
+// AI가 필요한 서술형 (일괄 채점 대상)
+const essayNeedsAi = (a) => a.answered_at && a.type === 'essay' && (a.submitted_answer || '').trim() && !['done', 'pending'].includes(a.ai_status);
+// 개별 AI 채점 버튼용 (기존 동작 유지: 기기 판정이 끝난 단답형은 제외)
+const needsAi = (a) => a.answered_at && a.auto_check !== 'alias_match' && a.auto_check !== 'local_wrong' && (a.submitted_answer || '').trim() && a.ai_status !== 'done' && a.ai_status !== 'pending';
 
-async function finalizeDraft(q, a) {
-  a.answered_at = nowIso();
-  if (q.type === 'short_answer') {
-    a.auto_check = aliasMatch(q, a.submitted_answer) ? 'alias_match' : 'no_match';
-    if (a.auto_check === 'alias_match') a.model_viewed_at = a.model_viewed_at || nowIso();
-  }
+function gradeShortLocally(q, a) {
+  a.auto_check = aliasMatch(q, a.submitted_answer) ? 'alias_match' : 'local_wrong';
+  a.local_graded_at = nowIso();
+  a.model_viewed_at = a.model_viewed_at || nowIso();   // 판정 후 모범답안 표시
+}
+
+async function setOverride(a, on) {
+  if (!a || a.auto_check !== 'local_wrong') return;
+  a.override = on ? 'correct' : '';
+  a.override_at = nowIso();
   await saveAttempt(a);
+  render();
+}
+
+function batchPlan() {
+  const entries = sessionEntries();
+  const fresh = entries.filter((x) => !x.a.answered_at && !isEmptyDraft(x.a));
+  return {
+    entries, fresh,
+    empties: entries.filter((x) => isEmptyDraft(x.a)),
+    written: entries.filter((x) => !isEmptyDraft(x.a)),
+    shortLocal: entries.filter((x) => shortNeedsLocal(x.a)),
+    essayAi: entries.filter((x) => essayNeedsAi(x.a)),
+    freshShort: fresh.filter((x) => isShortQ(x.q)).length,
+    freshEssay: fresh.filter((x) => !isShortQ(x.q)).length
+  };
 }
 
 async function batchStart(mode, confirmed = false) {
   if (state.batch.running) return;
   await flushDraft();
-  const entries = sessionEntries();
-  const empties = entries.filter((x) => isEmptyDraft(x.a));
-  const written = entries.filter((x) => !isEmptyDraft(x.a));
-  if (!written.length) { toast('작성한 답안이 없습니다. 답을 쓴 뒤 다시 눌러 주세요.'); return; }
-  if (mode === 'ai' && (!isOnline() || !serverReady())) { toast('AI 일괄 채점은 온라인 연결과 서버 설정이 필요합니다. 오프라인에서는 전체 모범답안 보기로 자기 평가하세요.', 4500); return; }
-  // 새로 제출할 답안이 있을 때만 빈 답안을 확인한다 (실패 후 재시도처럼 이미 제출된 답안만 다시 채점할 때는 묻지 않음)
-  const fresh = written.filter((x) => !x.a.answered_at);
-  if (empties.length && fresh.length && !confirmed) { state.batch.confirm = { mode, empties: empties.map((x) => x.i) }; render(); return; }
+  const P = batchPlan();
+  if (!P.written.length) { toast('작성한 답안이 없습니다. 답을 쓴 뒤 다시 눌러 주세요.'); return; }
+  // 새로 제출할 답안이 있을 때만 빈 답안을 확인한다 (재시도처럼 이미 제출된 답안만 다시 채점할 때는 묻지 않음)
+  if (P.empties.length && P.fresh.length && !confirmed) { state.batch.confirm = { mode, empties: P.empties.map((x) => x.i) }; render(); return; }
   state.batch.confirm = null;
   // 빈 답안은 제출하지 않는다(오답 처리 없음). 작성한 답안만 확정한다.
-  for (const { q, a } of written) if (!a.answered_at) await finalizeDraft(q, a);
+  for (const { q, a } of P.fresh) {
+    a.answered_at = nowIso();
+    if (isShortQ(q)) {
+      if (mode === 'grade') gradeShortLocally(q, a);
+      else { a.auto_check = aliasMatch(q, a.submitted_answer) ? 'alias_match' : 'no_match'; }
+    }
+    if (mode === 'model') a.model_viewed_at = a.model_viewed_at || nowIso();
+    await saveAttempt(a);
+  }
   if (mode === 'model') {
-    for (const { a } of written) if (!a.model_viewed_at) { a.model_viewed_at = nowIso(); await saveAttempt(a); }
+    for (const { a } of P.written) if (a.answered_at && !a.model_viewed_at) { a.model_viewed_at = nowIso(); await saveAttempt(a); }
     go('review');
     return;
   }
-  await batchGrade();
+  // 이미 제출돼 있던 단답형 중 판단이 없는 것도 기기에서 확정
+  for (const { q, a } of P.shortLocal) { gradeShortLocally(q, a); await saveAttempt(a); }
+  await gradeEssays();
 }
 
-async function batchGrade() {
-  const targets = sessionEntries().filter((x) => needsAi(x.a));
-  const local = sessionEntries().filter((x) => x.a.auto_check === 'alias_match').length;
-  if (!targets.length) {
-    toast(local ? `AI 채점할 문항이 없습니다. 허용 답안과 일치한 ${local}문항은 기기에서 정답 처리했습니다.` : 'AI 채점할 문항이 없습니다.', 4000);
+async function gradeEssays() {
+  const shorts = sessionEntries().filter((x) => x.a.answered_at && x.a.type === 'short_answer' && x.a.local_graded_at);
+  const okN = shorts.filter((x) => finalResult(x.a) === 'correct').length;
+  const shortMsg = shorts.length ? `단답형 ${shorts.length}문항 기기 채점(정답 ${okN})` : '';
+  const targets = sessionEntries().filter((x) => essayNeedsAi(x.a));
+  if (!targets.length) { toast(`전체 채점 완료${shortMsg ? ': ' + shortMsg : ''}`, 3500); go('review'); return; }
+  if (!isOnline() || !serverReady()) {
+    for (const { a } of targets) {
+      a.ai_status = 'waiting';
+      a.ai_error = !isOnline() ? '인터넷 연결이 없어 서술형은 채점 대기 중입니다. 연결된 뒤 ‘전체 채점’을 다시 누르면 서술형만 채점합니다.'
+        : '서버가 설정되지 않아 서술형은 채점 대기 중입니다. 설정에서 서버를 연결한 뒤 ‘전체 채점’을 다시 누르세요.';
+      await saveAttempt(a);
+    }
+    toast(`${shortMsg ? shortMsg + ' · ' : ''}서술형 ${targets.length}문항은 채점 대기 (인터넷 연결 후 다시 ‘전체 채점’)`, 5000);
     go('review'); return;
   }
   state.batch.running = true;
@@ -636,9 +696,9 @@ async function batchGrade() {
     while ([...keyOf.values()].includes(key)) key = `${q.id}:${n++}`;
     keyOf.set(a.attempt_id, key);
     return { key, answer: a.submitted_answer, question: { id: q.id, type: q.type, question: q.question, model_answer: q.model_answer,
-      accepted_answers: q.accepted_answers, key_points: q.key_points, explanation: q.explanation, topic: q.topic, grading_instructions: q.grading?.instructions } };
+      key_points: q.key_points, explanation: q.explanation, topic: q.topic, grading_instructions: q.grading?.instructions } };
   });
-  for (const { a } of targets) { a.ai_status = 'pending'; a.ai_error = ''; await saveAttempt(a, { bump: false }); }
+  for (const { a } of targets) { a.ai_status = 'pending'; a.ai_pending_mode = 'batch'; a.ai_error = ''; await saveAttempt(a, { bump: false }); }
   go('review');
   let ok = 0, miss = 0;
   try {
@@ -650,18 +710,20 @@ async function batchGrade() {
           ai_graded_at: r.graded_at || nowIso(), ai_mode: 'batch', ai_error: '' });
         ok++;
       } else {
-        a.ai_status = 'error'; a.ai_error = '일괄 채점 응답에 이 문항 결과가 없었습니다. ‘AI 일괄 채점’을 다시 누르면 이 문항만 다시 요청합니다.'; miss++;
+        a.ai_status = 'waiting'; a.ai_error = 'AI 응답에 이 문항 결과가 없었습니다. ‘전체 채점’을 다시 누르면 채점 대기 중인 서술형만 다시 요청합니다.'; miss++;
       }
+      delete a.ai_pending_mode;
       await saveAttempt(a);
     }
-    toast(`AI 일괄 채점 완료: ${ok}문항${miss ? ` · 결과 누락 ${miss}문항(다시 시도 가능)` : ''}${local ? ` · 허용 답안 일치 ${local}문항은 기기에서 채점` : ''}`, 4500);
+    toast(`전체 채점 완료: ${shortMsg ? shortMsg + ' · ' : ''}서술형 AI ${ok}문항${miss ? ` · 채점 대기 ${miss}문항` : ''}`, 4500);
   } catch (e) {
     for (const { a } of targets) {
-      a.ai_status = 'error';
-      a.ai_error = `일괄 채점 실패: ${e.message} — 답안은 그대로 저장되어 있습니다. 다시 시도하면 채점되지 않은 문항만 다시 요청합니다.`;
+      a.ai_status = 'waiting';
+      a.ai_error = `AI 채점 실패: ${e.message} — 답안은 저장되어 있습니다. ‘전체 채점’을 다시 누르면 채점 대기 중인 서술형만 다시 요청합니다.`;
+      delete a.ai_pending_mode;
       await saveAttempt(a);
     }
-    toast('AI 일괄 채점 실패: ' + e.message, 5000);
+    toast(`${shortMsg ? shortMsg + ' 완료 · ' : ''}서술형 AI 채점 실패: ${e.message}`, 5000);
   } finally {
     state.batch.running = false;
     render();
@@ -846,8 +908,8 @@ function viewQuiz() {
     if (!locked) {
       body += `<div class="row" style="margin-top:12px"><button class="btn primary" data-action="submit-short">제출</button>
         <button class="btn" data-action="unknown">모르겠음 · 모범답안 보기</button></div>`;
-    } else if (a.auto_check === 'alias_match') {
-      body += `<div class="panel ok"><h3>✓ 정답 — 등록된 허용 답안과 일치</h3></div>`;
+    } else if (a.auto_check === 'alias_match' || a.auto_check === 'local_wrong') {
+      body += shortVerdictPanel(a);
     } else {
       body += `<div class="panel warn"><h3>허용 답안 목록과 일치하지 않습니다</h3>
         <div>아직 오답으로 처리하지 않았습니다. 모범답안과 비교해 직접 평가하거나 AI 채점을 받아 보세요.</div>
@@ -898,34 +960,56 @@ function modelPanel(q) {
 }
 
 function assessPanel(a) {
-  if (a.auto_check === 'alias_match') return '';
+  if (a.auto_check === 'alias_match' || a.auto_check === 'local_wrong') return '';   // 기기 판정 단답형은 '정답으로 수정'으로 처리
   return `<div class="panel"><h3>내 자기 평가</h3><div class="sub">AI 채점과 별도로 저장됩니다.</div>
         <div class="assess">${['correct', 'needs_review', 'incorrect'].map((v) => `<button data-action="assess" data-aid="${esc(a.attempt_id)}" data-v="${v}" aria-pressed="${a.self_assessment === v}">${SELF_LABEL[v]}</button>`).join('')}</div></div>`;
 }
 
+// 단답형 기기 판정 결과 + '정답으로 수정' (판정 후 모범답안은 modelPanel로 함께 표시)
+function shortVerdictPanel(a) {
+  if (a.auto_check === 'alias_match') return `<div class="panel ok short-verdict"><h3>✓ 정답 — 등록된 정답·허용 답안과 일치 (기기에서 채점)</h3></div>`;
+  const aid = esc(a.attempt_id);
+  if (a.override === 'correct') {
+    return `<div class="panel ok short-verdict"><h3>✓ 정답으로 수정함 (내 판단)</h3>
+      <div class="sub">기기 판정은 ‘오답(허용 답안과 불일치)’이었습니다. ${fmtTime(a.override_at)} 수정</div>
+      <div class="row" style="margin-top:8px"><button class="btn small ghost" data-action="override-off" data-aid="${aid}">오답으로 되돌리기</button></div></div>`;
+  }
+  return `<div class="panel bad short-verdict"><h3>✗ 오답 — 등록된 정답·허용 답안과 일치하지 않음 (기기에서 채점)</h3>
+    <div class="sub">대소문자·공백·전각/반각 차이는 무시하고, 숫자 부호·소수점·기호는 그대로 비교했습니다. 아래 모범답안과 비교해 같은 뜻이라고 판단되면 수정하세요.</div>
+    <div class="row" style="margin-top:8px"><button class="btn small" data-action="override-on" data-aid="${aid}">정답으로 수정</button></div></div>`;
+}
+
 /* ---------- 세트 전체 도구 (문제 화면·전체 검토 화면 공통) ---------- */
 function batchBar() {
-  const entries = sessionEntries();
+  const P = batchPlan();
   const online = isOnline() && serverReady();
-  const written = entries.filter((x) => !isEmptyDraft(x.a)).length;
-  const aiLeft = entries.filter((x) => needsAi(x.a) || (!x.a.answered_at && !isEmptyDraft(x.a) && !(x.q.type === 'short_answer' && aliasMatch(x.q, x.a.submitted_answer)))).length;
-  const errs = entries.filter((x) => x.a.ai_status === 'error').length;
   const running = state.batch.running;
+  const shortTodo = P.freshShort + P.shortLocal.length;
+  const essayTodo = P.freshEssay + P.essayAi.length;
+  const waiting = P.entries.filter((x) => x.a.ai_status === 'waiting').length;
+  // 단답형·새 답안은 인터넷 없이도 채점·확정 가능. 서술형 AI만 온라인 필요
+  const canRun = !running && (P.fresh.length || P.shortLocal.length || (P.essayAi.length && online));
+  const label = running ? '<span class="spin"></span> 채점 중…'
+    : canRun ? '전체 채점' : essayTodo ? '전체 채점 (서술형은 온라인 필요)' : '✓ 전체 채점 완료';
   const c = state.batch.confirm;
   const confirm = c ? `<div class="panel warn" id="batch-confirm"><h3>빈 답안 ${c.empties.length}문항: ${c.empties.map((i) => i + 1 + '번').join(', ')}</h3>
       <div>빈 문항은 제출하지 않고 그대로 둡니다. <b>오답으로 처리하지 않으며</b>, 나중에 답을 쓰거나 문제별로 처리할 수 있습니다.</div>
       <div class="row" style="margin-top:10px">
         <button class="btn" data-action="jump" data-i="${c.empties[0]}">${c.empties[0] + 1}번 작성하러 가기</button>
-        <button class="btn primary" data-action="batch-confirm">빈 문항 빼고 ${c.mode === 'ai' ? '제출·채점' : '모범답안 보기'}</button>
+        <button class="btn primary" data-action="batch-confirm">빈 문항 빼고 ${c.mode === 'grade' ? '전체 채점' : '모범답안 보기'}</button>
         <button class="btn ghost" data-action="batch-cancel">취소</button></div></div>` : '';
+  const hint = [];
+  if (shortTodo) hint.push(`단답형 ${shortTodo}문항: 기기에서 허용 답안과 비교해 정답·오답 확정 (인터넷 불필요)`);
+  if (essayTodo) hint.push(`서술형 ${essayTodo}문항: AI 한 번 요청으로 채점${online ? '' : ' — 지금은 오프라인이라 채점 대기로 남습니다'}`);
+  if (!hint.length) hint.push('작성한 답안은 모두 채점되었습니다. 빈 문항에 답을 쓰면 다시 채점할 수 있습니다.');
   return `<div class="card batchbar" id="batch-bar"><div class="row between"><h2 style="margin:0">세트 전체</h2>
-      <div class="sub">작성 ${written}/${entries.length}${errs ? ` · 채점 실패 ${errs}문항` : ''}</div></div>
+      <div class="sub">작성 ${P.written.length}/${P.entries.length}${waiting ? ` · 서술형 채점 대기 ${waiting}` : ''}</div></div>
     <div class="row" style="margin-top:10px">
-      <button class="btn primary" data-action="batch-ai" ${online && !running && aiLeft ? '' : 'disabled'}>${running ? '<span class="spin"></span> AI 일괄 채점 중…' : errs ? 'AI 일괄 채점 다시 시도' : aiLeft ? '전체 답안 제출 · AI 일괄 채점' : '✓ AI 채점할 문항 없음'}${aiLeft ? needLabel() : ''}</button>
+      <button class="btn primary" data-action="batch-grade" ${canRun ? '' : 'disabled'}>${label}</button>
       <button class="btn dark" data-action="batch-model" ${running ? 'disabled' : ''}>전체 모범답안 보기</button>
       ${state.view !== 'review' ? `<button class="btn ghost" data-action="go" data-view="review">전체 검토</button>` : `<button class="btn ghost" data-action="go" data-view="quiz">문제 화면으로</button>`}
     </div>
-    <div class="sub" style="margin-top:6px">${aiLeft ? `허용 답안과 일치한 단답형은 기기에서 바로 채점하고, 나머지 ${aiLeft}문항만 한 번의 AI 요청으로 채점합니다. 제출하면 답안이 확정됩니다.` : '작성한 답안은 모두 채점되었거나 허용 답안과 일치했습니다. 빈 문항에 답을 쓰면 다시 일괄 채점할 수 있습니다.'}${online ? '' : ' 오프라인에서는 전체 모범답안을 보고 문제별로 자기 평가하세요.'}</div>
+    <div class="sub" style="margin-top:6px">${hint.join('<br>')}<br>제출하면 답안이 확정됩니다.</div>
     ${confirm}</div>`;
 }
 
@@ -941,12 +1025,12 @@ function viewReview() {
         <div class="row" style="margin-top:8px"><button class="btn small" data-action="jump" data-i="${i}">이 문제 풀기</button></div></div>`;
     } else {
       body = `<div class="label">내 답</div><div class="myans">${esc(a.submitted_answer || '(모르겠음)')}</div>`;
-      if (a.auto_check === 'alias_match') body += `<div class="panel ok"><h3>✓ 정답 — 등록된 허용 답안과 일치 (기기에서 채점)</h3></div>`;
+      if (a.auto_check === 'alias_match' || a.auto_check === 'local_wrong') body += shortVerdictPanel(a);
       if (a.model_viewed_at) body += modelPanel(q) + assessPanel(a);
       body += aiPanel(a);
       const btns = [];
       if (!a.model_viewed_at) btns.push(`<button class="btn small" data-action="view-model" data-aid="${esc(a.attempt_id)}">모범답안 보기</button>`);
-      if (a.auto_check !== 'alias_match' && (a.submitted_answer || '').trim()) { const b = aiButton(a, online); if (b) btns.push(b.replace('class="btn"', 'class="btn small"')); }
+      if (needsAi(a) || a.ai_status === 'pending') { const b = aiButton(a, online); if (b) btns.push(b.replace('class="btn"', 'class="btn small"')); }
       if (btns.length) body += `<div class="row" style="margin-top:10px">${btns.join('')}</div>`;
     }
     return `<div class="card review-item" data-qid="${esc(q.id)}"><div class="row between"><div class="sub">${i + 1}번 · 문항 ID ${esc(q.id)}</div>
@@ -966,6 +1050,7 @@ function aiButton(a, online) {
 }
 
 function aiPanel(a) {
+  if (a.ai_status === 'waiting') return `<div class="panel warn ai-wait"><h3>⏳ AI 채점 대기</h3><div>${esc(a.ai_error || '‘전체 채점’을 다시 누르면 서술형만 채점합니다.')}</div><div class="sub">모범답안 보기로 자기 평가를 해 둘 수도 있습니다. 자기 평가와 AI 결과는 따로 저장됩니다.</div></div>`;
   if (a.ai_status === 'error') return `<div class="panel bad"><h3>AI 채점 실패</h3><div>${esc(a.ai_error)}</div><div class="sub">답안과 자기 평가는 그대로 저장되어 있습니다.</div></div>`;
   if (a.ai_status !== 'done') return '';
   const d = a.ai_detail || {};
@@ -985,7 +1070,7 @@ function viewSummary() {
     const r = finalResult(a);
     return `<div class="item"><div class="row between"><div class="q">${i + 1}. ${esc(q?.question)}</div><span class="res ${r}">${RESULT_LABEL[r]}</span></div>
       <div class="meta">${TYPE_LABEL[q?.type]} · 내 답: ${esc(a?.submitted_answer || '(없음)')}</div>
-      <div class="meta">자동 확인: ${a?.auto_check === 'alias_match' ? '허용답안 일치' : a?.type === 'short_answer' ? '불일치(판단 보류)' : '-'} · 자기 평가: ${SELF_LABEL[a?.self_assessment] || '-'} · AI: ${a?.ai_status === 'done' ? AI_LABEL[a.ai_verdict] : '-'}</div>
+      <div class="meta">자동 확인: ${a?.auto_check === 'alias_match' ? '허용답안 일치' : a?.auto_check === 'local_wrong' ? (a.override === 'correct' ? '불일치 → 정답으로 수정' : '불일치(기기 판정 오답)') : a?.type === 'short_answer' ? '불일치(판단 보류)' : '-'} · 자기 평가: ${SELF_LABEL[a?.self_assessment] || '-'} · AI: ${a?.ai_status === 'done' ? AI_LABEL[a.ai_verdict] : '-'}</div>
       <button class="btn small ghost" data-action="jump" data-i="${i}">다시 보기</button></div>`;
   }).join('');
   return `<div class="card"><h1>세트 결과</h1><div class="list">${rows}</div>
@@ -1026,7 +1111,7 @@ function viewRecords() {
     return `<div class="item${other ? ' other' : ''}"><div class="row between"><div class="q">${esc(a.question_text)}</div><span class="res ${r}">${RESULT_LABEL[r]}</span></div>
       <div class="meta">${other ? '<span class="badge">다른 기기</span> ' : ''}${fmtTime(a.answered_at)} · ${TYPE_LABEL[a.type]} · 내 답: ${esc(a.submitted_answer || '(없음)')}</div>
       ${a.merge_note ? `<div class="meta">⚠ 다른 기기에서도 수정된 기록이라 병합했습니다 (${fmtTime(a.merge_note.at)})</div>` : ''}
-      <div class="meta">자기 평가: ${SELF_LABEL[a.self_assessment]} · AI: ${a.ai_status === 'done' ? AI_LABEL[a.ai_verdict] + ' ' + a.ai_score + '점' : a.ai_status === 'error' ? '실패' : '-'} ·
+      <div class="meta">자기 평가: ${SELF_LABEL[a.self_assessment]} · ${a.auto_check === 'local_wrong' ? `기기 판정: 오답${a.override === 'correct' ? ' → 정답으로 수정' : ''} · ` : a.auto_check === 'alias_match' ? '기기 판정: 정답 · ' : ''}AI: ${a.ai_status === 'done' ? AI_LABEL[a.ai_verdict] + ' ' + a.ai_score + '점' : a.ai_status === 'error' ? '실패' : a.ai_status === 'waiting' ? '채점 대기' : '-'} ·
       ${needsSync(a) ? '<b>미전송</b>' : '서버 저장 확인 ' + fmtTime(a.last_synced_at)}</div></div>`;
   }).join('');
   const others = list.filter((a) => a.device_id && a.device_id !== state.deviceId).length;
@@ -1090,7 +1175,17 @@ function onInput(e) {
     a.submitted_answer = e.target.value;
     clearTimeout(draftTimer);
     draftTimer = setTimeout(() => saveAttempt(a, { bump: false }), 400); // 작성 중 답안도 기기에 계속 저장
+    refreshBatchBar();
   }
+}
+
+// 입력 중에는 화면 전체를 다시 그리지 않고(입력칸 포커스 유지) 세트 전체 칸만 갱신한다
+function refreshBatchBar() {
+  const el = document.getElementById('batch-bar');
+  if (!el) return;
+  const tmp = document.createElement('div');
+  tmp.innerHTML = batchBar();
+  if (tmp.firstElementChild && tmp.firstElementChild.outerHTML !== el.outerHTML) el.replaceWith(tmp.firstElementChild);
 }
 
 async function onChange(e) {
@@ -1128,7 +1223,9 @@ async function onClick(e) {
     case 'view-model': { const a = cur(); if (a) await viewModel(a); break; }
     case 'assess': { const a = cur(); if (a) await selfAssess(a, el.dataset.v); break; }
     case 'ai': { const a = cur(); if (a) await aiGrade(a); break; }
-    case 'batch-ai': await batchStart('ai'); break;
+    case 'batch-grade': await batchStart('grade'); break;
+    case 'override-on': await setOverride(cur(), true); break;
+    case 'override-off': await setOverride(cur(), false); break;
     case 'batch-model': await batchStart('model'); break;
     case 'batch-confirm': { const c = state.batch.confirm; if (c) await batchStart(c.mode, true); break; }
     case 'batch-cancel': state.batch.confirm = null; render(); break;
